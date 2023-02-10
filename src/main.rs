@@ -1,37 +1,52 @@
-use clap::{Parser, error};
+use clap::Parser;
 use log::*;
-use std::{env, error::Error, path};
+use std::{default, env};
 use teloxide::{
     net::Download,
     prelude::*,
-    utils::command::{self, BotCommands},
-    RequestError,
+    types::Chat,
+    utils::command::{ BotCommands},
+    RequestError, dispatching::{dialogue::{InMemStorage, self}, UpdateHandler},
 };
 use tokio::fs::File;
-
 #[macro_use]
 extern crate lazy_static;
 
-async fn command_handler(msg: Message, bot: Bot, cmd: Command) -> Result<(),RequestError> {
+type MyDialogue = Dialogue<State, InMemStorage<State>>;
+type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+#[derive(Clone, Default)]
+enum State { 
+    #[default]
+    Start,
+    RevicedMessage,
+    RevicedMessageChoice,
+}
+
+async fn command_handler(msg: Message, bot: Bot, cmd: Command) -> HandlerResult {
     match cmd {
-        Command::DownloadChannel{channelid} => download_handler(msg, bot).await?,
+        Command::Download => download_handler(msg, bot).await?,
         Command::Help => {
             bot.send_message(msg.chat.id, Command::descriptions().to_string())
                 .await?
         }
-
+        Command::DownloadChannel => {
+            if let Some(source_msg) = msg.forward_from_chat() {
+                println!("{}", source_msg.id);
+            }
+            msg
+        }
     };
     Ok(())
 }
 
-
-async fn download_handler(message: Message, bot: Bot) -> Result<(), RequestError> {
+async fn download_handler(message: Message, bot: Bot) -> Result<Message, RequestError> {
     if let Some(id) = ARGS.allowed_user.clone() {
         if message.chat.id.to_string() != id {
             bot.send_message(message.chat.id, "Permission Denied.")
                 .await
                 .expect("Unable to send message.");
-            return Ok(());
+            return Ok(message);
         }
     }
 
@@ -59,10 +74,10 @@ async fn download_handler(message: Message, bot: Bot) -> Result<(), RequestError
         } else {
             error!("{}", video_file.unwrap_err().to_string())
         }
-        return Ok(());
+        return Ok(message);
     }
     info!("No video received.");
-    Ok(())
+    Ok(message)
 }
 
 #[derive(Parser, Debug)]
@@ -81,14 +96,40 @@ struct Args {
 #[derive(BotCommands, Clone)]
 #[command(description = "Commands:", rename_rule = "lowercase")]
 enum Command {
+    #[command(description = "download video")]
+    Download,
     #[command(description = "channel id to download")]
-    DownloadChannel { channelid: String },
+    DownloadChannel,
     #[command(description = "show this text")]
     Help,
+    #[command(description = "cancel ")]
+    Cancel,
 }
 
 lazy_static! {
     static ref ARGS: Args = Args::parse();
+}
+async fn cancel(bot: Bot, dialogue: MyDialogue, msg: Message) -> HandlerResult {
+    bot.send_message(msg.chat.id, "Cancel the dialogue").await?;
+    dialogue.exit().await?;
+    Ok(())
+}
+
+async fn invalid_state(bot: Bot, msg: Message) -> HandlerResult {
+    bot.send_message(msg.chat.id, "invalid command, please use /help ").await?;
+    Ok(())
+}
+
+fn schema() -> UpdateHandler<Box<dyn std::error::Error + Send + Sync + 'static>> {
+    use dptree::case;
+    let command_handler = teloxide::filter_command::<Command, _>().branch(
+        case![State::Start]
+        .branch(case![Command::Help].endpoint(command_handler))
+    )
+    .branch(case![Command::Cancel].endpoint(cancel));
+
+
+    
 }
 
 #[tokio::main]
@@ -108,5 +149,12 @@ async fn main() {
     if let Some(s) = ARGS.allowed_user.clone() {
         warn!("Whitelist enabled: {}", s)
     }
-    teloxide::repl(bot, handler).await;
+    Dispatcher::builder(bot, schema())
+    .dependencies(dptree::deps![InMemStorage::<State>::new()])
+    .enable_ctrlc_handler()
+    .build()
+    .dispatch()
+    .await;
+    bot.set_my_commands(Command::bot_commands()).await.unwrap();
+    Command::repl(bot, command_handler).await;
 }
